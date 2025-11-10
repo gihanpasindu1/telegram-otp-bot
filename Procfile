@@ -1,0 +1,1 @@
+worker: python customer_otp_bot.py
