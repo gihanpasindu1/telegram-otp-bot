@@ -3,29 +3,29 @@ from pathlib import Path
 from bs4 import BeautifulSoup
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-# ================== CONFIG via environment ==================
+# ================== ENVIRONMENT CONFIG ==================
 TG_TOKEN = os.getenv("TG_TOKEN", "")
 ALLOWED_DOMAIN = os.getenv("ALLOWED_DOMAIN", "yotomail.com").lower()
 MAX_REQUESTS_PER_USER = int(os.getenv("MAX_REQUESTS_PER_USER", "10"))
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "6356573938").split(",") if x.strip()}
 DELAY_SECONDS = int(os.getenv("DELAY_SECONDS", "30"))
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
-# ============================================================
+# ========================================================
 
 GENEMAIL_BASE = "https://generator.email/"
-OTP_REGEX = r"\b(\d{6})\b"   # OTP is always 6 digits
+OTP_REGEX = r"\b(\d{6})\b"
 TIMEOUT = 20
 
-# ---------- persistence (usage counters + last codes) ----------
+# ---------- Persistence (Save limits + last OTPs) ----------
 def load_state():
     p = Path(STATE_FILE)
     if not p.exists():
         return {"usage": {}, "last_codes": {}}
     try:
         data = json.loads(p.read_text())
-        if not isinstance(data, dict):
-            return {"usage": {}, "last_codes": {}}
         data.setdefault("usage", {})
         data.setdefault("last_codes", {})
         return data
@@ -41,45 +41,26 @@ def save_state(state):
 STATE = load_state()
 
 def get_user_count(uid): return int(STATE["usage"].get(str(uid), {}).get("count", 0))
-
 def inc_user_count(uid):
     rec = STATE["usage"].get(str(uid), {"count": 0})
     rec["count"] = int(rec.get("count", 0)) + 1
-    STATE["usage"][str(uid)] = rec
-    save_state(STATE)
-
-def reset_user_count(uid):
-    STATE["usage"][str(uid)] = {"count": 0}
-    save_state(STATE)
-
+    STATE["usage"][str(uid)] = rec; save_state(STATE)
+def reset_user_count(uid): STATE["usage"][str(uid)] = {"count": 0}; save_state(STATE)
 def get_last_code(email): return (STATE["last_codes"].get(email, {}) or {}).get("code")
-
 def set_last_code(email, code):
-    STATE["last_codes"][email] = {"code": code, "ts": int(time.time())}
-    save_state(STATE)
+    STATE["last_codes"][email] = {"code": code, "ts": int(time.time())}; save_state(STATE)
+def clear_last_code(email): STATE["last_codes"].pop(email, None); save_state(STATE)
 
-def clear_last_code(email):
-    STATE["last_codes"].pop(email, None)
-    save_state(STATE)
-
-# ---------- helpers ----------
+# ---------- Email + OTP Helpers ----------
 def is_allowed_email(email: str) -> bool:
     if "@" not in email:
         return False
     local, domain = email.strip().rsplit("@", 1)
     return bool(local) and domain.lower() == ALLOWED_DOMAIN
 
-# Shared requests session with retries + browser headers
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-
+# Shared requests session with retries and fake browser headers
 session = requests.Session()
-retry_strategy = Retry(
-    total=3,
-    backoff_factor=1,
-    status_forcelist=[403, 429, 500, 502, 503, 504],
-    allowed_methods=["GET"],
-)
+retry_strategy = Retry(total=3, backoff_factor=1, status_forcelist=[403, 429, 500, 502, 503, 504])
 adapter = HTTPAdapter(max_retries=retry_strategy)
 session.mount("https://", adapter)
 session.mount("http://", adapter)
@@ -98,27 +79,19 @@ BROWSER_HEADERS = {
 }
 
 def fetch_inbox_html(email: str) -> str:
-    """
-    Fetch the generator.email inbox page with realistic headers and retries.
-    """
+    """Fetch the generator.email inbox page."""
     url = f"{GENEMAIL_BASE.rstrip('/')}/{email.strip()}"
     try:
         r = session.get(url, headers=BROWSER_HEADERS, timeout=TIMEOUT)
         r.raise_for_status()
         return r.text
     except requests.exceptions.RequestException as e:
-        # Normalize the error so the user sees a clear message
         raise Exception(f"Could not fetch inbox: {e}")
 
 def extract_latest_otp(html: str):
-    """
-    Parse the messages table (newest first). Extract the first 6-digit number
-    from the Subject cell (or row text) to avoid old OTPs.
-    """
+    """Parse the inbox table and find the newest 6-digit OTP."""
     soup = BeautifulSoup(html, "html.parser")
     rows = soup.select("table tr")
-    if not rows:
-        return None
     for row in rows:
         tds = row.find_all("td")
         text = tds[1].get_text(" ") if len(tds) >= 2 else row.get_text(" ")
@@ -127,12 +100,13 @@ def extract_latest_otp(html: str):
             return m.group(1)
     return None
 
-# ---------- commands ----------
+# ---------- Telegram Commands ----------
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
+        f"👋 Hey {update.effective_user.first_name}!\n"
         f"Send `/otp yourname@{ALLOWED_DOMAIN}`\n"
-        f"I'll wait {DELAY_SECONDS}s then check your inbox.\n"
-        f"Per-user limit: {MAX_REQUESTS_PER_USER}",
+        f"I’ll wait {DELAY_SECONDS}s then check your inbox.\n"
+        f"Limit: {MAX_REQUESTS_PER_USER} requests per user.",
         parse_mode="Markdown",
     )
 
@@ -143,75 +117,64 @@ async def otp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"Usage: `/otp yourname@{ALLOWED_DOMAIN}`", parse_mode="Markdown"
         )
 
-    # enforce per-user cap
     used = get_user_count(uid)
     if used >= MAX_REQUESTS_PER_USER:
-        return await update.message.reply_text(
-            f"Limit reached ({used}/{MAX_REQUESTS_PER_USER})."
-        )
+        return await update.message.reply_text(f"❌ Limit reached ({used}/{MAX_REQUESTS_PER_USER}).")
 
     email = ctx.args[0].strip()
     if not is_allowed_email(email):
-        return await update.message.reply_text(
-            f"Only emails ending with `@{ALLOWED_DOMAIN}` are allowed.",
-            parse_mode="Markdown",
-        )
+        return await update.message.reply_text(f"❌ Only @{ALLOWED_DOMAIN} emails are allowed.")
 
-    await update.message.reply_text(f"Waiting {DELAY_SECONDS} seconds for your OTP…")
+    await update.message.reply_text(f"⏳ Waiting {DELAY_SECONDS}s before checking your inbox…")
     await asyncio.sleep(DELAY_SECONDS)
 
     try:
         html = fetch_inbox_html(email)
         code = extract_latest_otp(html)
         if not code:
-            return await update.message.reply_text("No OTP found yet. Try again shortly.")
-        # warn if same as last
+            return await update.message.reply_text("⚠️ No OTP found yet. Try again shortly.")
         if get_last_code(email) == code:
-            await update.message.reply_text("Heads up: same as the last OTP we saw for this email (might be old).")
-
+            await update.message.reply_text("⚠️ Same OTP as last time (may be old).")
         inc_user_count(uid)
         set_last_code(email, code)
         remaining = MAX_REQUESTS_PER_USER - get_user_count(uid)
         await update.message.reply_text(
-            f"Your OTP for `{email}` is: *`{code}`*\nRemaining: {remaining}",
-            parse_mode="Markdown",
+            f"✅ OTP for `{email}` → *`{code}`*\nRemaining: {remaining}", parse_mode="Markdown"
         )
     except Exception as e:
-        await update.message.reply_text(f"Error: {e}")
+        await update.message.reply_text(f"⚠️ Error: {e}")
 
 async def remaining(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     used = get_user_count(uid)
-    await update.message.reply_text(
-        f"Used {used}/{MAX_REQUESTS_PER_USER}. Remaining {MAX_REQUESTS_PER_USER - used}."
-    )
+    await update.message.reply_text(f"📊 Used {used}/{MAX_REQUESTS_PER_USER}. Remaining {MAX_REQUESTS_PER_USER - used}.")
 
 async def resetlimit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
-        return await update.message.reply_text("Admin only.")
+        return await update.message.reply_text("❌ Admin only.")
     if not ctx.args:
         return await update.message.reply_text("Usage: /resetlimit <user_id>")
     reset_user_count(ctx.args[0])
-    await update.message.reply_text(f"Reset for {ctx.args[0]}.")
+    await update.message.reply_text(f"✅ Reset for {ctx.args[0]}.")
 
 async def clearemail(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
-        return await update.message.reply_text("Admin only.")
+        return await update.message.reply_text("❌ Admin only.")
     if not ctx.args:
         return await update.message.reply_text("Usage: /clearemail <email>")
     clear_last_code(ctx.args[0])
-    await update.message.reply_text(f"Cleared OTP memory for {ctx.args[0]}.")
+    await update.message.reply_text(f"✅ Cleared OTP cache for {ctx.args[0]}.")
 
 def main():
     if not TG_TOKEN:
-        raise SystemExit("TG_TOKEN env var is required.")
+        raise SystemExit("⚠️ TG_TOKEN env variable missing.")
     app = ApplicationBuilder().token(TG_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("otp", otp))
     app.add_handler(CommandHandler("remaining", remaining))
     app.add_handler(CommandHandler("resetlimit", resetlimit))
     app.add_handler(CommandHandler("clearemail", clearemail))
-    print("Bot running. Ctrl+C to stop.")
+    print("✅ Bot is running...")
     app.run_polling()
 
 if __name__ == "__main__":
