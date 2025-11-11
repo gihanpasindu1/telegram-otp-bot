@@ -173,13 +173,15 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     welcome_text = (
-    f"✨ **Welcome to Digital Creed OTP Service!** ✨\n\n"
+    f"✨ Welcome to Digital Creed OTP Service ✨\n\n"
     f"🔹 Need a quick OTP? Just send:\n"
-    f"`/otp yourname@{ALLOWED_DOMAIN}`\n\n"
-    f"⏱️ I’ll wait **{DELAY_SECONDS} seconds** before checking your inbox to ensure your code arrives.\n"
-    f"👤 Each user gets **{MAX_REQUESTS_PER_USER} requests** total.\n"
-    f"🚫 After every check — whether an OTP is found or not — please wait **3 minutes** before making another request.\n\n"
-    f"💡 *Tip:* Make sure your email is correctly typed to get your code faster!"
+    f"/otp yourname@{ALLOWED_DOMAIN}\n\n"
+    f"⏱️ I’ll wait {DELAY_SECONDS} seconds before checking your inbox to make sure your code arrives.\n\n"
+    f"👤 Each user can make up to {MAX_REQUESTS_PER_USER} requests in total.\n\n"
+    f"🚫 After every check — whether an OTP is found or not — please wait 3 minutes before making another request.\n\n"
+    f"💡 Tip: Double-check your email spelling for faster results!\n\n"
+    f"📩 Example:\n"
+    f"/otp yourname@{ALLOWED_DOMAIN}"
 )
 
 
