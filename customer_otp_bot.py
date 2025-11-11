@@ -286,6 +286,13 @@ async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 state_manager.cache_otp(email, otp)
                 state_manager.set_cooldown(user.id, COOLDOWN_SECONDS)
 
+                # --- WRITE LOG: success ---
+                try:
+                    with open("otp_log.txt", "a") as lf:
+                        lf.write(f"[{datetime.now()}] user={user.id} email={email} result=OTP:{otp}\n")
+                except Exception as _:
+                    pass
+
                 _note_net_success()
 
                 now_used = state_manager.get_user_requests(user.id)
@@ -302,6 +309,14 @@ async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 # no OTP found; do NOT decrement quota
                 state_manager.set_cooldown(user.id, COOLDOWN_SECONDS)
+
+                # --- WRITE LOG: no otp ---
+                try:
+                    with open("otp_log.txt", "a") as lf:
+                        lf.write(f"[{datetime.now()}] user={user.id} email={email} result=NO_OTP\n")
+                except Exception as _:
+                    pass
+
                 _note_net_success()
                 await update.message.reply_text(
                     "❌ No OTP found right now. Please try again later."
@@ -309,6 +324,13 @@ async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
         except httpx.HTTPError:
+            # --- WRITE LOG: network error (per attempt) ---
+            try:
+                with open("otp_log.txt", "a") as lf:
+                    lf.write(f"[{datetime.now()}] user={user.id} email={email} result=NETWORK_ERROR attempt={round_idx}\n")
+            except Exception as _:
+                pass
+
             # Network error: retry up to 5 rounds, 5s between attempts.
             if round_idx < max_rounds:
                 await update.message.reply_text(
@@ -325,6 +347,14 @@ async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         except Exception as e:
             logger.error(f"Unexpected error in otp_command: {e}")
+
+            # --- WRITE LOG: unexpected error ---
+            try:
+                with open("otp_log.txt", "a") as lf:
+                    lf.write(f"[{datetime.now()}] user={user.id} email={email} result=UNEXPECTED_ERROR:{str(e)[:120]}\n")
+            except Exception as _:
+                pass
+
             _note_net_error_and_maybe_restart()
             await update.message.reply_text(
                 "❌ An unexpected error occurred. Please try again."
@@ -410,7 +440,6 @@ async def showlog_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user:
         return
 
-    # Only admins can view logs
     if user.id not in ADMIN_IDS:
         await update.message.reply_text("⛔ This command is restricted to admins only.")
         return
@@ -468,7 +497,7 @@ def main():
     application.add_handler(CommandHandler("remaining", remaining_command))
     application.add_handler(CommandHandler("resetlimit", resetlimit_command))
     application.add_handler(CommandHandler("clearemail", clearemail_command))
-    application.add_handler(CommandHandler("log", showlog_command))  # <-- added
+    application.add_handler(CommandHandler("log", showlog_command))
 
     application.add_error_handler(error_handler)
 
