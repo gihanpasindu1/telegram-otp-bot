@@ -274,7 +274,7 @@ async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await asyncio.sleep(DELAY_SECONDS)
 
-    # ------- NEW: retry loop on NETWORK errors only -------
+    # ------- RETRY LOOP with user-visible attempt messages on NETWORK errors -------
     max_rounds = 5
     for round_idx in range(1, max_rounds + 1):
         try:
@@ -311,6 +311,9 @@ async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except httpx.HTTPError:
             # Network error: retry up to 5 rounds, 5s between attempts.
             if round_idx < max_rounds:
+                await update.message.reply_text(
+                    f"⚠️ Network issue (attempt {round_idx}/{max_rounds}). Retrying in 5 seconds..."
+                )
                 await asyncio.sleep(5)
                 continue
             # After 5 network-error rounds, give up politely.
@@ -327,7 +330,7 @@ async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "❌ An unexpected error occurred. Please try again."
             )
             return
-    # ------------------------------------------------------
+    # ------------------------------------------------------------------------------
 
 async def remaining_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
