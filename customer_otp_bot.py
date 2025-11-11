@@ -4,6 +4,7 @@ import re
 import asyncio
 import logging
 import time
+import threading
 from typing import Optional
 from datetime import datetime
 from pathlib import Path
@@ -27,9 +28,16 @@ MAX_REQUESTS_PER_USER = int(os.getenv("MAX_REQUESTS_PER_USER", "10"))
 DELAY_SECONDS = int(os.getenv("DELAY_SECONDS", "30"))
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
 COOLDOWN_SECONDS = 180  # 3 minutes cooldown after success OR "no OTP"
+
+# Self-healing knobs (optional)
+RESTART_EVERY_MIN = int(os.getenv("RESTART_EVERY_MIN", "0"))          # 0 = disabled
+ERROR_RESTART_THRESHOLD = int(os.getenv("ERROR_RESTART_THRESHOLD", "6"))  # restart if this many network errors in a row
 # ---------------------------
 
 OTP_PATTERN = re.compile(r"\b(\d{6})\b")
+
+# Track consecutive network-ish errors for auto-restart
+_CONSEC_ERRORS = 0
 
 class StateManager:
     def __init__(self, state_file: str):
@@ -109,7 +117,6 @@ state_manager = StateManager(STATE_FILE)
 async def fetch_otp_from_generator(email: str) -> Optional[str]:
     """
     Fetch the inbox HTML and extract a 6-digit OTP.
-    (Kept your existing approach; no provider names are shown to the user.)
     """
     inbox_url = f"https://generator.email/{email}"
 
@@ -163,6 +170,36 @@ async def fetch_otp_from_generator(email: str) -> Optional[str]:
 
     return None
 
+# ---------------- Self-healing helpers ----------------
+def _start_timed_restart_thread():
+    """Exit the process after RESTART_EVERY_MIN minutes (if enabled)."""
+    if RESTART_EVERY_MIN <= 0:
+        return
+
+    def _worker():
+        logger.warning(f"Timed restart enabled. Will restart in {RESTART_EVERY_MIN} minutes.")
+        time.sleep(RESTART_EVERY_MIN * 60)
+        logger.warning("Timed restart: exiting process for Railway to restart.")
+        os._exit(0)
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+
+def _note_net_success():
+    global _CONSEC_ERRORS
+    _CONSEC_ERRORS = 0
+
+def _note_net_error_and_maybe_restart():
+    """Increment error counter; if threshold reached, exit for Railway to restart."""
+    global _CONSEC_ERRORS
+    _CONSEC_ERRORS += 1
+    if ERROR_RESTART_THRESHOLD > 0 and _CONSEC_ERRORS >= ERROR_RESTART_THRESHOLD:
+        logger.error(
+            f"Consecutive network errors reached {ERROR_RESTART_THRESHOLD}. "
+            "Exiting for Railway to auto-restart."
+        )
+        os._exit(1)
+
 # ---------------- Commands ----------------
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
@@ -173,24 +210,16 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     welcome_text = (
-    f"✨ Welcome to Digital Creed OTP Service ✨\n\n"
-    f"🔹 Need a quick OTP? Just send:\n"
-    f"/otp yourname@{ALLOWED_DOMAIN}\n\n"
-    f"⏱️ I’ll wait {DELAY_SECONDS} seconds before checking your inbox to make sure your code arrives.\n\n"
-    f"👤 Each user can make up to {MAX_REQUESTS_PER_USER} requests in total.\n\n"
-    f"🚫 After every check — whether an OTP is found or not — please wait 3 minutes before making another request.\n\n"
-    f"💡 Tip: Double-check your email spelling for faster results!\n\n"
-    f"📩 Example:\n"
-    f"/otp yourname@{ALLOWED_DOMAIN}"
-)
-
-
-    if user.id in ADMIN_IDS:
-        welcome_text += (
-            f"\n\nAdmin:\n"
-            f"/resetlimit <user_id>\n"
-            f"/clearemail <email>"
-        )
+        f"✨ Welcome to Digital Creed OTP Service ✨\n\n"
+        f"🔹 Need a quick OTP? Just send:\n"
+        f"/otp yourname@{ALLOWED_DOMAIN}\n\n"
+        f"⏱️ I’ll wait {DELAY_SECONDS} seconds before checking your inbox to make sure your code arrives.\n\n"
+        f"👤 Each user can make up to {MAX_REQUESTS_PER_USER} requests in total.\n\n"
+        f"🚫 After every check — whether an OTP is found or not — please wait 3 minutes before making another request.\n\n"
+        f"💡 Tip: Double-check your email spelling for faster results!\n\n"
+        f"📩 Example:\n"
+        f"/otp yourname@{ALLOWED_DOMAIN}"
+    )
 
     await update.message.reply_text(welcome_text)
 
@@ -246,11 +275,12 @@ async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         otp = await fetch_otp_from_generator(email)
 
         if otp:
-            # count only on success
+            # Count ONLY on success
             state_manager.increment_user_requests(user.id)
             state_manager.cache_otp(email, otp)
-            # start cooldown after a completed check (found)
             state_manager.set_cooldown(user.id, COOLDOWN_SECONDS)
+
+            _note_net_success()
 
             now_used = state_manager.get_user_requests(user.id)
             remaining = MAX_REQUESTS_PER_USER - now_used
@@ -264,21 +294,21 @@ async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             # no OTP found; do NOT decrement quota
-            # start cooldown after a completed check (not found)
             state_manager.set_cooldown(user.id, COOLDOWN_SECONDS)
-
+            _note_net_success()
             await update.message.reply_text(
-                f"❌ No OTP found right now.\n"
-                f"Please try again later."
+                "❌ No OTP found right now. Please try again later."
             )
 
     except httpx.HTTPError:
-        # on network/HTTP error: no site/provider names; no cooldown set
+        # Generic wording; no provider name. No cooldown on error.
+        _note_net_error_and_maybe_restart()
         await update.message.reply_text(
             "⚠️ Network error while checking your mailbox. Please try again."
         )
     except Exception as e:
         logger.error(f"Unexpected error in otp_command: {e}")
+        _note_net_error_and_maybe_restart()
         await update.message.reply_text(
             "❌ An unexpected error occurred. Please try again."
         )
@@ -295,12 +325,16 @@ async def remaining_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     remaining = MAX_REQUESTS_PER_USER - current_requests
     cd = state_manager.remaining_cooldown(user.id)
 
-    text = (
-        f"📊 Used: {current_requests}/{MAX_REQUESTS_PER_USER}\n"
-        f"⏱️ Cooldown: {cd} seconds left" if cd > 0 else
-        f"📊 Used: {current_requests}/{MAX_REQUESTS_PER_USER}\n"
-        f"✅ No cooldown active"
-    )
+    if cd > 0:
+        text = (
+            f"📊 Used: {current_requests}/{MAX_REQUESTS_PER_USER}\n"
+            f"⏱️ Cooldown: {cd} seconds left"
+        )
+    else:
+        text = (
+            f"📊 Used: {current_requests}/{MAX_REQUESTS_PER_USER}\n"
+            f"✅ No cooldown active"
+        )
     await update.message.reply_text(text)
 
 async def resetlimit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -367,6 +401,11 @@ def main():
     logger.info(f"Delay: {DELAY_SECONDS} seconds")
     logger.info(f"State file: {STATE_FILE}")
     logger.info(f"Cooldown: {COOLDOWN_SECONDS} seconds")
+    logger.info(f"Timed restart every (min): {RESTART_EVERY_MIN}")
+    logger.info(f"Error restart threshold: {ERROR_RESTART_THRESHOLD}")
+
+    # Start timed self-restart thread (if enabled)
+    _start_timed_restart_thread()
 
     application = Application.builder().token(TG_TOKEN).build()
 
