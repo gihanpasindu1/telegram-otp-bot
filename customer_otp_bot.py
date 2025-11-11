@@ -27,7 +27,7 @@ ALLOWED_DOMAIN = os.getenv("ALLOWED_DOMAIN", "yotomail.com")
 MAX_REQUESTS_PER_USER = int(os.getenv("MAX_REQUESTS_PER_USER", "10"))
 DELAY_SECONDS = int(os.getenv("DELAY_SECONDS", "30"))
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
-COOLDOWN_SECONDS = 180  # 3 minutes cooldown after success OR "no OTP"
+COOLDOWN_SECONDS = 90  # 3 minutes cooldown after success OR "no OTP"
 
 # Self-healing knobs (optional)
 RESTART_EVERY_MIN = int(os.getenv("RESTART_EVERY_MIN", "0"))          # 0 = disabled
