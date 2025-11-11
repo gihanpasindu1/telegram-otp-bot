@@ -44,17 +44,6 @@ class StateManager:
         self.state_file = state_file
         self.state = self._load_state()
 
-    def log_otp_request(user_id: int, email: str, result: str):
-        """Append a line to the otp_log.txt file with timestamp and result."""
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        log_line = f"[{timestamp}] User:{user_id} Email:{email} Result:{result}\n"
-        try:
-            with open("otp_log.txt", "a") as f:
-                f.write(log_line)
-        except Exception as e:
-            logger.error(f"Error writing to otp_log.txt: {e}")
-
-
     def _load_state(self) -> dict:
         Path(self.state_file).parent.mkdir(parents=True, exist_ok=True)
         if os.path.exists(self.state_file):
@@ -66,10 +55,9 @@ class StateManager:
                 data = {}
         else:
             data = {}
-        # normalize structure
         data.setdefault("user_requests", {})
         data.setdefault("cached_otps", {})
-        data.setdefault("cooldowns", {})  # user_id -> next_allowed_ts
+        data.setdefault("cooldowns", {})
         return data
 
     def _save_state(self):
@@ -79,7 +67,6 @@ class StateManager:
         except Exception as e:
             logger.error(f"Error saving state: {e}")
 
-    # ---- quotas ----
     def get_user_requests(self, user_id: int) -> int:
         return self.state["user_requests"].get(str(user_id), 0)
 
@@ -94,7 +81,6 @@ class StateManager:
             del self.state["user_requests"][uid]
         self._save_state()
 
-    # ---- otp cache ----
     def cache_otp(self, email: str, otp: str):
         self.state["cached_otps"][email] = {
             "otp": otp,
@@ -109,7 +95,6 @@ class StateManager:
             return True
         return False
 
-    # ---- cooldowns ----
     def set_cooldown(self, user_id: int, seconds: int):
         next_allowed = int(time.time()) + seconds
         self.state["cooldowns"][str(user_id)] = next_allowed
@@ -126,9 +111,6 @@ class StateManager:
 state_manager = StateManager(STATE_FILE)
 
 async def fetch_otp_from_generator(email: str) -> Optional[str]:
-    """
-    Fetch the inbox HTML and extract a 6-digit OTP.
-    """
     inbox_url = f"https://generator.email/{email}"
 
     headers = {
@@ -158,8 +140,6 @@ async def fetch_otp_from_generator(email: str) -> Optional[str]:
                 response.raise_for_status()
 
                 soup = BeautifulSoup(response.text, "html.parser")
-
-                # Scan common text containers for a 6-digit code
                 email_bodies = soup.find_all(["div", "p", "span", "td"])
                 for element in email_bodies:
                     text = element.get_text()
@@ -178,47 +158,38 @@ async def fetch_otp_from_generator(email: str) -> Optional[str]:
                     await asyncio.sleep(2)
                 else:
                     raise
-
     return None
 
-# ---------------- Self-healing helpers ----------------
 def _start_timed_restart_thread():
-    """Exit the process after RESTART_EVERY_MIN minutes (if enabled)."""
     if RESTART_EVERY_MIN <= 0:
         return
-
     def _worker():
+        import sys
         logger.warning(f"Timed restart enabled. Will restart every {RESTART_EVERY_MIN} minutes.")
         while True:
             time.sleep(RESTART_EVERY_MIN * 60)
             logger.warning("Restarting bot now...")
             os.execv(sys.executable, ["python"] + sys.argv)
-
     import sys
     t = threading.Thread(target=_worker, daemon=True)
     t.start()
-
 
 def _note_net_success():
     global _CONSEC_ERRORS
     _CONSEC_ERRORS = 0
 
 def _note_net_error_and_maybe_restart():
-    """Increment error counter; if threshold reached, exit for Railway to restart."""
     global _CONSEC_ERRORS
     _CONSEC_ERRORS += 1
     if ERROR_RESTART_THRESHOLD > 0 and _CONSEC_ERRORS >= ERROR_RESTART_THRESHOLD:
         logger.error(
-            f"Consecutive network errors reached {ERROR_RESTART_THRESHOLD}. "
-            "Exiting for Railway to auto-restart."
+            f"Consecutive network errors reached {ERROR_RESTART_THRESHOLD}. Exiting for Railway to auto-restart."
         )
         os._exit(1)
 
-# ---------------- Commands ----------------
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
-
     user = update.effective_user
     if not user:
         return
@@ -227,227 +198,105 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✨ Welcome to Digital Creed OTP Service ✨\n\n"
         f"🔹 Need a quick OTP? Just send:\n"
         f"/otp yourname@{ALLOWED_DOMAIN}\n\n"
-        f"⏱️ I’ll wait {DELAY_SECONDS} seconds before checking your inbox to make sure your code arrives.\n\n"
-        f"👤 Each user can make up to {MAX_REQUESTS_PER_USER} requests in total.\n\n"
-        f"🚫 After every check — whether an OTP is found or not — please wait 3 minutes before making another request.\n\n"
-        f"💡 Tip: Double-check your email spelling for faster results!\n\n"
+        f"⏱️ I’ll wait {DELAY_SECONDS} seconds before checking your inbox.\n\n"
+        f"👤 Each user can make up to {MAX_REQUESTS_PER_USER} requests.\n\n"
+        f"🚫 After every check — found or not — please wait 3 minutes before trying again.\n\n"
         f"📩 Example:\n"
         f"/otp yourname@{ALLOWED_DOMAIN}"
     )
-
     await update.message.reply_text(welcome_text)
 
 async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
-
     user = update.effective_user
     if not user:
         return
-
-    # cooldown gate
     cd = state_manager.remaining_cooldown(user.id)
     if cd > 0:
-        await update.message.reply_text(
-            f"⏳ Please wait {cd} seconds before requesting again."
-        )
+        await update.message.reply_text(f"⏳ Please wait {cd} seconds before requesting again.")
         return
-
     if not context.args:
-        await update.message.reply_text(
-            "❌ Please provide an email address.\n"
-            f"Example: /otp yourname@{ALLOWED_DOMAIN}"
-        )
+        await update.message.reply_text(f"❌ Usage: /otp yourname@{ALLOWED_DOMAIN}")
         return
-
     email = context.args[0].strip().lower()
-
     if not email.endswith(f"@{ALLOWED_DOMAIN}"):
-        await update.message.reply_text(
-            f"❌ Invalid email domain. Only @{ALLOWED_DOMAIN} is supported."
-        )
+        await update.message.reply_text(f"❌ Only @{ALLOWED_DOMAIN} supported.")
         return
-
-    # do not count yet; only count on success
     current_requests = state_manager.get_user_requests(user.id)
     if current_requests >= MAX_REQUESTS_PER_USER:
-        await update.message.reply_text(
-            f"⛔ You reached your limit ({MAX_REQUESTS_PER_USER})."
-        )
+        await update.message.reply_text(f"⛔ Limit {MAX_REQUESTS_PER_USER} reached.")
         return
     remaining_if_success = MAX_REQUESTS_PER_USER - (current_requests + 1)
-
     await update.message.reply_text(
-        f"⏳ Waiting {DELAY_SECONDS} seconds before checking…\n"
-        f"📧 {email}\n"
-        f"📊 Remaining (if success): {remaining_if_success}"
+        f"⏳ Waiting {DELAY_SECONDS} seconds...\n📧 {email}\n📊 Remaining (if success): {remaining_if_success}"
     )
-
     await asyncio.sleep(DELAY_SECONDS)
-
-    # ------- RETRY LOOP with user-visible attempt messages on NETWORK errors -------
-    max_rounds = 5
-    for round_idx in range(1, max_rounds + 1):
-        try:
-            otp = await fetch_otp_from_generator(email)
-
-            if otp:
-                # Count ONLY on success
-                state_manager.increment_user_requests(user.id)
-                state_manager.cache_otp(email, otp)
-                state_manager.set_cooldown(user.id, COOLDOWN_SECONDS)
-
-                _note_net_success()
-
-                now_used = state_manager.get_user_requests(user.id)
-                remaining = MAX_REQUESTS_PER_USER - now_used
-
-                await update.message.reply_text(
-                    f"✅ OTP Found!\n\n"
-                    f"🔢 Code: `{otp}`\n"
-                    f"📧 {email}\n"
-                    f"📊 Remaining: {remaining}",
-                    parse_mode="Markdown",
-                )
-                return
-            else:
-                # no OTP found; do NOT decrement quota
-                state_manager.set_cooldown(user.id, COOLDOWN_SECONDS)
-                _note_net_success()
-                await update.message.reply_text(
-                    "❌ No OTP found right now. Please try again later."
-                )
-                return
-
-        except httpx.HTTPError:
-            # Network error: retry up to 5 rounds, 5s between attempts.
-            if round_idx < max_rounds:
-                await update.message.reply_text(
-                    f"⚠️ Network issue (attempt {round_idx}/{max_rounds}). Retrying in 5 seconds..."
-                )
-                await asyncio.sleep(5)
-                continue
-            # After 5 network-error rounds, give up politely.
-            _note_net_error_and_maybe_restart()
-            await update.message.reply_text(
-                "⚠️ Network issue. Please wait a few minutes and try again."
-            )
-            return
-
-        except Exception as e:
-            logger.error(f"Unexpected error in otp_command: {e}")
-            _note_net_error_and_maybe_restart()
-            await update.message.reply_text(
-                "❌ An unexpected error occurred. Please try again."
-            )
-            return
-    # ------------------------------------------------------------------------------
-
-async def remaining_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return
-
-    user = update.effective_user
-    if not user:
-        return
-
-    current_requests = state_manager.get_user_requests(user.id)
-    remaining = MAX_REQUESTS_PER_USER - current_requests
-    cd = state_manager.remaining_cooldown(user.id)
-
-    if cd > 0:
-        text = (
-            f"📊 Used: {current_requests}/{MAX_REQUESTS_PER_USER}\n"
-            f"⏱️ Cooldown: {cd} seconds left"
-        )
-    else:
-        text = (
-            f"📊 Used: {current_requests}/{MAX_REQUESTS_PER_USER}\n"
-            f"✅ No cooldown active"
-        )
-    await update.message.reply_text(text)
-
-async def resetlimit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return
-
-    user = update.effective_user
-    if not user:
-        return
-
-    if user.id not in ADMIN_IDS:
-        await update.message.reply_text("⛔ Admin only.")
-        return
-
-    if not context.args:
-        await update.message.reply_text("❌ Usage: /resetlimit <user_id>")
-        return
-
     try:
-        target_user_id = int(context.args[0])
-        state_manager.reset_user_limit(target_user_id)
-        await update.message.reply_text(f"✅ Reset done for user {target_user_id}")
-    except ValueError:
-        await update.message.reply_text("❌ Invalid user ID (must be a number).")
+        otp = await fetch_otp_from_generator(email)
+        with open("otp_log.txt", "a") as f:
+            f.write(f"[{datetime.now()}] User:{user.id} Email:{email} OTP:{otp or 'None'}\n")
 
-async def clearemail_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return
+        if otp:
+            state_manager.increment_user_requests(user.id)
+            state_manager.cache_otp(email, otp)
+            state_manager.set_cooldown(user.id, COOLDOWN_SECONDS)
+            _note_net_success()
+            now_used = state_manager.get_user_requests(user.id)
+            remaining = MAX_REQUESTS_PER_USER - now_used
+            await update.message.reply_text(
+                f"✅ OTP Found!\n\n🔢 Code: `{otp}`\n📧 {email}\n📊 Remaining: {remaining}",
+                parse_mode="Markdown",
+            )
+        else:
+            state_manager.set_cooldown(user.id, COOLDOWN_SECONDS)
+            _note_net_success()
+            await update.message.reply_text("❌ No OTP found right now.")
+    except httpx.HTTPError:
+        _note_net_error_and_maybe_restart()
+        await update.message.reply_text("⚠️ Network error while checking your mailbox. Please try again.")
+    except Exception as e:
+        logger.error(f"Unexpected error in otp_command: {e}")
+        _note_net_error_and_maybe_restart()
+        await update.message.reply_text("❌ Unexpected error. Please try again.")
 
+# ---------- ADMIN /log COMMAND ----------
+async def showlog_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user:
         return
-
     if user.id not in ADMIN_IDS:
-        await update.message.reply_text("⛔ Admin only.")
+        await update.message.reply_text("⛔ This command is restricted to admins only.")
         return
-
-    if not context.args:
-        await update.message.reply_text(
-            "❌ Usage: /clearemail <email>\n"
-            f"Example: /clearemail user@{ALLOWED_DOMAIN}"
-        )
-        return
-
-    email = context.args[0].lower()
-    if state_manager.clear_email(email):
-        await update.message.reply_text(f"✅ Cached OTP cleared for {email}")
-    else:
-        await update.message.reply_text(f"ℹ️ No cached OTP found for {email}")
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.error(f"Update {update} caused error {context.error}")
+    log_file = "otp_log.txt"
+    try:
+        with open(log_file, "r") as f:
+            lines = f.readlines()
+        if not lines:
+            await update.message.reply_text("📭 Log file is empty.")
+            return
+        full_log = "".join(lines)
+        if len(full_log) > 4000:  # Telegram message limit ~4096 chars
+            # Send in chunks if it's long
+            chunks = [full_log[i:i+4000] for i in range(0, len(full_log), 4000)]
+            for i, chunk in enumerate(chunks, start=1):
+                await update.message.reply_text(f"📜 Log Part {i}:\n\n{chunk}")
+        else:
+            await update.message.reply_text(f"🧾 Full Log:\n\n{full_log}")
+    except FileNotFoundError:
+        await update.message.reply_text("⚠️ No log file found yet.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error reading log: {e}")
 
 def main():
     if not TG_TOKEN:
-        logger.error("TG_TOKEN environment variable is not set!")
-        print("❌ ERROR: TG_TOKEN environment variable is required.")
+        print("❌ TG_TOKEN missing!")
         return
-
-    logger.info("Starting OTP bot...")
-    logger.info(f"Admin IDs: {ADMIN_IDS}")
-    logger.info(f"Allowed domain: {ALLOWED_DOMAIN}")
-    logger.info(f"Max requests per user: {MAX_REQUESTS_PER_USER}")
-    logger.info(f"Delay: {DELAY_SECONDS} seconds")
-    logger.info(f"State file: {STATE_FILE}")
-    logger.info(f"Cooldown: {COOLDOWN_SECONDS} seconds")
-    logger.info(f"Timed restart every (min): {RESTART_EVERY_MIN}")
-    logger.info(f"Error restart threshold: {ERROR_RESTART_THRESHOLD}")
-
-    # Start timed self-restart thread (if enabled)
     _start_timed_restart_thread()
-
     application = Application.builder().token(TG_TOKEN).build()
-
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("otp", otp_command))
-    application.add_handler(CommandHandler("remaining", remaining_command))
-    application.add_handler(CommandHandler("resetlimit", resetlimit_command))
-    application.add_handler(CommandHandler("clearemail", clearemail_command))
-
-    application.add_error_handler(error_handler)
-
-    logger.info("Bot is running. Ctrl+C to stop.")
+    application.add_handler(CommandHandler("log", showlog_command))
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
