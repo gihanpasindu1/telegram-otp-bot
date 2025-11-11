@@ -177,13 +177,16 @@ def _start_timed_restart_thread():
         return
 
     def _worker():
-        logger.warning(f"Timed restart enabled. Will restart in {RESTART_EVERY_MIN} minutes.")
-        time.sleep(RESTART_EVERY_MIN * 60)
-        logger.warning("Timed restart: exiting process for Railway to restart.")
-        os._exit(0)
+        logger.warning(f"Timed restart enabled. Will restart every {RESTART_EVERY_MIN} minutes.")
+        while True:
+            time.sleep(RESTART_EVERY_MIN * 60)
+            logger.warning("Restarting bot now...")
+            os.execv(sys.executable, ["python"] + sys.argv)
 
+    import sys
     t = threading.Thread(target=_worker, daemon=True)
     t.start()
+
 
 def _note_net_success():
     global _CONSEC_ERRORS
