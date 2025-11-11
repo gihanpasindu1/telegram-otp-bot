@@ -274,47 +274,60 @@ async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await asyncio.sleep(DELAY_SECONDS)
 
-    try:
-        otp = await fetch_otp_from_generator(email)
+    # ------- NEW: retry loop on NETWORK errors only -------
+    max_rounds = 5
+    for round_idx in range(1, max_rounds + 1):
+        try:
+            otp = await fetch_otp_from_generator(email)
 
-        if otp:
-            # Count ONLY on success
-            state_manager.increment_user_requests(user.id)
-            state_manager.cache_otp(email, otp)
-            state_manager.set_cooldown(user.id, COOLDOWN_SECONDS)
+            if otp:
+                # Count ONLY on success
+                state_manager.increment_user_requests(user.id)
+                state_manager.cache_otp(email, otp)
+                state_manager.set_cooldown(user.id, COOLDOWN_SECONDS)
 
-            _note_net_success()
+                _note_net_success()
 
-            now_used = state_manager.get_user_requests(user.id)
-            remaining = MAX_REQUESTS_PER_USER - now_used
+                now_used = state_manager.get_user_requests(user.id)
+                remaining = MAX_REQUESTS_PER_USER - now_used
 
+                await update.message.reply_text(
+                    f"✅ OTP Found!\n\n"
+                    f"🔢 Code: `{otp}`\n"
+                    f"📧 {email}\n"
+                    f"📊 Remaining: {remaining}",
+                    parse_mode="Markdown",
+                )
+                return
+            else:
+                # no OTP found; do NOT decrement quota
+                state_manager.set_cooldown(user.id, COOLDOWN_SECONDS)
+                _note_net_success()
+                await update.message.reply_text(
+                    "❌ No OTP found right now. Please try again later."
+                )
+                return
+
+        except httpx.HTTPError:
+            # Network error: retry up to 5 rounds, 5s between attempts.
+            if round_idx < max_rounds:
+                await asyncio.sleep(5)
+                continue
+            # After 5 network-error rounds, give up politely.
+            _note_net_error_and_maybe_restart()
             await update.message.reply_text(
-                f"✅ OTP Found!\n\n"
-                f"🔢 Code: `{otp}`\n"
-                f"📧 {email}\n"
-                f"📊 Remaining: {remaining}",
-                parse_mode="Markdown",
+                "⚠️ Network issue. Please wait a few minutes and try again."
             )
-        else:
-            # no OTP found; do NOT decrement quota
-            state_manager.set_cooldown(user.id, COOLDOWN_SECONDS)
-            _note_net_success()
-            await update.message.reply_text(
-                "❌ No OTP found right now. Please try again later."
-            )
+            return
 
-    except httpx.HTTPError:
-        # Generic wording; no provider name. No cooldown on error.
-        _note_net_error_and_maybe_restart()
-        await update.message.reply_text(
-            "⚠️ Network error while checking your mailbox. Please try again."
-        )
-    except Exception as e:
-        logger.error(f"Unexpected error in otp_command: {e}")
-        _note_net_error_and_maybe_restart()
-        await update.message.reply_text(
-            "❌ An unexpected error occurred. Please try again."
-        )
+        except Exception as e:
+            logger.error(f"Unexpected error in otp_command: {e}")
+            _note_net_error_and_maybe_restart()
+            await update.message.reply_text(
+                "❌ An unexpected error occurred. Please try again."
+            )
+            return
+    # ------------------------------------------------------
 
 async def remaining_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
