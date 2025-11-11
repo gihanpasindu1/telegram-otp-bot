@@ -44,6 +44,17 @@ class StateManager:
         self.state_file = state_file
         self.state = self._load_state()
 
+    def log_otp_request(user_id: int, email: str, result: str):
+        """Append a line to the otp_log.txt file with timestamp and result."""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_line = f"[{timestamp}] User:{user_id} Email:{email} Result:{result}\n"
+        try:
+            with open("otp_log.txt", "a") as f:
+                f.write(log_line)
+        except Exception as e:
+            logger.error(f"Error writing to otp_log.txt: {e}")
+
+
     def _load_state(self) -> dict:
         Path(self.state_file).parent.mkdir(parents=True, exist_ok=True)
         if os.path.exists(self.state_file):
