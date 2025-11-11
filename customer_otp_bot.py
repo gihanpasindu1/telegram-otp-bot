@@ -3,6 +3,7 @@ import json
 import re
 import asyncio
 import logging
+import time
 from typing import Optional
 from datetime import datetime
 from pathlib import Path
@@ -25,6 +26,7 @@ ALLOWED_DOMAIN = os.getenv("ALLOWED_DOMAIN", "yotomail.com")
 MAX_REQUESTS_PER_USER = int(os.getenv("MAX_REQUESTS_PER_USER", "10"))
 DELAY_SECONDS = int(os.getenv("DELAY_SECONDS", "30"))
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
+COOLDOWN_SECONDS = 180  # 3 minutes cooldown after success OR "no OTP"
 # ---------------------------
 
 OTP_PATTERN = re.compile(r"\b(\d{6})\b")
@@ -39,11 +41,17 @@ class StateManager:
         if os.path.exists(self.state_file):
             try:
                 with open(self.state_file, "r") as f:
-                    return json.load(f)
+                    data = json.load(f)
             except Exception as e:
                 logger.error(f"Error loading state: {e}")
-                return {"user_requests": {}, "cached_otps": {}}
-        return {"user_requests": {}, "cached_otps": {}}
+                data = {}
+        else:
+            data = {}
+        # normalize structure
+        data.setdefault("user_requests", {})
+        data.setdefault("cached_otps", {})
+        data.setdefault("cooldowns", {})  # user_id -> next_allowed_ts
+        return data
 
     def _save_state(self):
         try:
@@ -52,22 +60,22 @@ class StateManager:
         except Exception as e:
             logger.error(f"Error saving state: {e}")
 
+    # ---- quotas ----
     def get_user_requests(self, user_id: int) -> int:
         return self.state["user_requests"].get(str(user_id), 0)
 
     def increment_user_requests(self, user_id: int):
-        user_id_str = str(user_id)
-        self.state["user_requests"][user_id_str] = (
-            self.state["user_requests"].get(user_id_str, 0) + 1
-        )
+        uid = str(user_id)
+        self.state["user_requests"][uid] = self.state["user_requests"].get(uid, 0) + 1
         self._save_state()
 
     def reset_user_limit(self, user_id: int):
-        user_id_str = str(user_id)
-        if user_id_str in self.state["user_requests"]:
-            del self.state["user_requests"][user_id_str]
+        uid = str(user_id)
+        if uid in self.state["user_requests"]:
+            del self.state["user_requests"][uid]
         self._save_state()
 
+    # ---- otp cache ----
     def cache_otp(self, email: str, otp: str):
         self.state["cached_otps"][email] = {
             "otp": otp,
@@ -82,9 +90,27 @@ class StateManager:
             return True
         return False
 
+    # ---- cooldowns ----
+    def set_cooldown(self, user_id: int, seconds: int):
+        next_allowed = int(time.time()) + seconds
+        self.state["cooldowns"][str(user_id)] = next_allowed
+        self._save_state()
+
+    def remaining_cooldown(self, user_id: int) -> int:
+        now = int(time.time())
+        next_allowed = int(self.state["cooldowns"].get(str(user_id), 0))
+        if next_allowed > now:
+            return next_allowed - now
+        return 0
+
+
 state_manager = StateManager(STATE_FILE)
 
 async def fetch_otp_from_generator(email: str) -> Optional[str]:
+    """
+    Fetch the inbox HTML and extract a 6-digit OTP.
+    (Kept your existing approach; no provider names are shown to the user.)
+    """
     inbox_url = f"https://generator.email/{email}"
 
     headers = {
@@ -137,6 +163,7 @@ async def fetch_otp_from_generator(email: str) -> Optional[str]:
 
     return None
 
+# ---------------- Commands ----------------
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
@@ -146,21 +173,18 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     welcome_text = (
-        f"👋 Welcome to OTP Fetcher Bot!\n\n"
-        f"📧 I can fetch OTP codes from @{ALLOWED_DOMAIN} email addresses.\n\n"
-        f"📝 Commands:\n"
-        f"• /otp <email> — Fetch OTP\n"
-        f"• /remaining — Check remaining requests\n\n"
-        f"⚠️ Limit: {MAX_REQUESTS_PER_USER} per user\n"
-        f"⏱️ Delay: {DELAY_SECONDS}s\n\n"
-        f"Example: /otp yourname@{ALLOWED_DOMAIN}"
+        f"👋 Welcome!\n\n"
+        f"Use `/otp yourname@{ALLOWED_DOMAIN}` to check for your 6-digit code.\n"
+        f"I wait {DELAY_SECONDS}s before checking.\n"
+        f"Per-user limit: {MAX_REQUESTS_PER_USER} requests.\n"
+        f"After a check (found or not), you must wait 3 minutes before the next one."
     )
 
     if user.id in ADMIN_IDS:
         welcome_text += (
-            f"\n\n👑 Admin:\n"
-            f"• /resetlimit <user_id>\n"
-            f"• /clearemail <email>"
+            f"\n\nAdmin:\n"
+            f"/resetlimit <user_id>\n"
+            f"/clearemail <email>"
         )
 
     await update.message.reply_text(welcome_text)
@@ -171,6 +195,14 @@ async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user = update.effective_user
     if not user:
+        return
+
+    # cooldown gate
+    cd = state_manager.remaining_cooldown(user.id)
+    if cd > 0:
+        await update.message.reply_text(
+            f"⏳ Please wait {cd} seconds before requesting again."
+        )
         return
 
     if not context.args:
@@ -184,11 +216,11 @@ async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not email.endswith(f"@{ALLOWED_DOMAIN}"):
         await update.message.reply_text(
-            f"❌ Invalid email domain.\nOnly @{ALLOWED_DOMAIN} is supported."
+            f"❌ Invalid email domain. Only @{ALLOWED_DOMAIN} is supported."
         )
         return
 
-    # --- CHANGED LOGIC: don't count yet; only count after success ---
+    # do not count yet; only count on success
     current_requests = state_manager.get_user_requests(user.id)
     if current_requests >= MAX_REQUESTS_PER_USER:
         await update.message.reply_text(
@@ -196,11 +228,10 @@ async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     remaining_if_success = MAX_REQUESTS_PER_USER - (current_requests + 1)
-    # ---------------------------------------------------------------
 
     await update.message.reply_text(
-        f"⏳ Waiting {DELAY_SECONDS} seconds for OTP to arrive...\n"
-        f"📧 Email: {email}\n"
+        f"⏳ Waiting {DELAY_SECONDS} seconds before checking…\n"
+        f"📧 {email}\n"
         f"📊 Remaining (if success): {remaining_if_success}"
     )
 
@@ -210,9 +241,11 @@ async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         otp = await fetch_otp_from_generator(email)
 
         if otp:
-            # Count ONLY on success:
+            # count only on success
             state_manager.increment_user_requests(user.id)
             state_manager.cache_otp(email, otp)
+            # start cooldown after a completed check (found)
+            state_manager.set_cooldown(user.id, COOLDOWN_SECONDS)
 
             now_used = state_manager.get_user_requests(user.id)
             remaining = MAX_REQUESTS_PER_USER - now_used
@@ -220,31 +253,29 @@ async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 f"✅ OTP Found!\n\n"
                 f"🔢 Code: `{otp}`\n"
-                f"📧 Email: {email}\n"
+                f"📧 {email}\n"
                 f"📊 Remaining: {remaining}",
                 parse_mode="Markdown",
             )
         else:
-            # No increment here
+            # no OTP found; do NOT decrement quota
+            # start cooldown after a completed check (not found)
+            state_manager.set_cooldown(user.id, COOLDOWN_SECONDS)
+
             await update.message.reply_text(
-                f"❌ No OTP found.\n"
-                f"📧 Email: {email}\n"
-                f"📊 Used: {current_requests}/{MAX_REQUESTS_PER_USER}"
+                f"❌ No OTP found right now.\n"
+                f"Please try again later."
             )
 
-    except httpx.HTTPError as e:
-        # No increment here
+    except httpx.HTTPError:
+        # on network/HTTP error: no site/provider names; no cooldown set
         await update.message.reply_text(
-            f"⚠️ Network error contacting generator.email.\n"
-            f"Error: {str(e)[:100]}\n\n"
-            f"📊 Used: {current_requests}/{MAX_REQUESTS_PER_USER}"
+            "⚠️ Network error while checking your mailbox. Please try again."
         )
     except Exception as e:
         logger.error(f"Unexpected error in otp_command: {e}")
-        # No increment here
         await update.message.reply_text(
-            f"❌ Unexpected error. Try again later.\n"
-            f"📊 Used: {current_requests}/{MAX_REQUESTS_PER_USER}"
+            "❌ An unexpected error occurred. Please try again."
         )
 
 async def remaining_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -257,12 +288,15 @@ async def remaining_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     current_requests = state_manager.get_user_requests(user.id)
     remaining = MAX_REQUESTS_PER_USER - current_requests
+    cd = state_manager.remaining_cooldown(user.id)
 
-    await update.message.reply_text(
-        f"📊 Request status:\n"
-        f"Used: {current_requests}/{MAX_REQUESTS_PER_USER}\n"
-        f"Remaining: {remaining}"
+    text = (
+        f"📊 Used: {current_requests}/{MAX_REQUESTS_PER_USER}\n"
+        f"⏱️ Cooldown: {cd} seconds left" if cd > 0 else
+        f"📊 Used: {current_requests}/{MAX_REQUESTS_PER_USER}\n"
+        f"✅ No cooldown active"
     )
+    await update.message.reply_text(text)
 
 async def resetlimit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
@@ -321,12 +355,13 @@ def main():
         print("❌ ERROR: TG_TOKEN environment variable is required.")
         return
 
-    logger.info("Starting Telegram OTP Fetcher Bot...")
+    logger.info("Starting OTP bot...")
     logger.info(f"Admin IDs: {ADMIN_IDS}")
     logger.info(f"Allowed domain: {ALLOWED_DOMAIN}")
     logger.info(f"Max requests per user: {MAX_REQUESTS_PER_USER}")
     logger.info(f"Delay: {DELAY_SECONDS} seconds")
     logger.info(f"State file: {STATE_FILE}")
+    logger.info(f"Cooldown: {COOLDOWN_SECONDS} seconds")
 
     application = Application.builder().token(TG_TOKEN).build()
 
