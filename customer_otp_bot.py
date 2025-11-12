@@ -478,19 +478,17 @@ def main():
         return
 
     logger.info("Starting OTP bot...")
-    logger.info(f"Admin IDs: {ADMIN_IDS}")
-    logger.info(f"Allowed domain: {ALLOWED_DOMAIN}")
-    logger.info(f"Max requests per user: {MAX_REQUESTS_PER_USER}")
-    logger.info(f"Delay: {DELAY_SECONDS} seconds")
-    logger.info(f"State file: {STATE_FILE}")
-    logger.info(f"Cooldown: {COOLDOWN_SECONDS} seconds")
-    logger.info(f"Timed restart every (min): {RESTART_EVERY_MIN}")
-    logger.info(f"Error restart threshold: {ERROR_RESTART_THRESHOLD}")
+    # ... your logs ...
 
-    # Start timed self-restart thread (if enabled)
     _start_timed_restart_thread()
 
-    application = Application.builder().token(TG_TOKEN).build()
+    application = (
+        Application
+        .builder()
+        .token(TG_TOKEN)
+        .concurrent_updates(True)   # enable parallel handling
+        .build()
+    )
 
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("otp", otp_command))
@@ -498,11 +496,10 @@ def main():
     application.add_handler(CommandHandler("resetlimit", resetlimit_command))
     application.add_handler(CommandHandler("clearemail", clearemail_command))
     application.add_handler(CommandHandler("log", showlog_command))
-
     application.add_error_handler(error_handler)
 
-    logger.info("Bot is running. Ctrl+C to stop.")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
     main()
