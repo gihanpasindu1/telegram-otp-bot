@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 # ----------- ENV -----------
 TG_TOKEN = os.getenv("TG_TOKEN")
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "6356573938").split(",")]
-ALLOWED_DOMAIN = os.getenv("ALLOWED_DOMAIN", "code-gmail.com")
+ALLOWED_DOMAIN = "code-gmail.com"  # <-- hard-coded domain
 MAX_REQUESTS_PER_USER = int(os.getenv("MAX_REQUESTS_PER_USER", "10"))
 DELAY_SECONDS = int(os.getenv("DELAY_SECONDS", "30"))
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
@@ -181,9 +181,9 @@ def _start_timed_restart_thread():
         while True:
             time.sleep(RESTART_EVERY_MIN * 60)
             logger.warning("Restarting bot now...")
+            import sys
             os.execv(sys.executable, ["python"] + sys.argv)
 
-    import sys
     t = threading.Thread(target=_worker, daemon=True)
     t.start()
 
