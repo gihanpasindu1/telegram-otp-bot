@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 # ----------- ENV -----------
 TG_TOKEN = os.getenv("TG_TOKEN")
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "6356573938").split(",")]
-ALLOWED_DOMAIN = os.getenv("ALLOWED_DOMAIN", "yotomail.com")
+ALLOWED_DOMAIN = os.getenv("ALLOWED_DOMAIN", "code-gmail.com")
 MAX_REQUESTS_PER_USER = int(os.getenv("MAX_REQUESTS_PER_USER", "10"))
 DELAY_SECONDS = int(os.getenv("DELAY_SECONDS", "30"))
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
