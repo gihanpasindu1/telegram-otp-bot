@@ -59,6 +59,7 @@ class StateManager:
         data.setdefault("user_requests", {})
         data.setdefault("cached_otps", {})
         data.setdefault("cooldowns", {})  # user_id -> next_allowed_ts
+        data.setdefault("blocked_emails", {})  # email -> {timestamp, by}
         return data
 
     def _save_state(self):
@@ -110,6 +111,24 @@ class StateManager:
         if next_allowed > now:
             return next_allowed - now
         return 0
+
+    # ---- blocked emails ----
+    def is_blocked(self, email: str) -> bool:
+        return email in self.state.get("blocked_emails", {})
+
+    def block_email(self, email: str, by_user_id: int):
+        self.state["blocked_emails"][email] = {
+            "timestamp": datetime.now().isoformat(),
+            "by": by_user_id,
+        }
+        self._save_state()
+
+    def unblock_email(self, email: str) -> bool:
+        if email in self.state.get("blocked_emails", {}):
+            del self.state["blocked_emails"][email]
+            self._save_state()
+            return True
+        return False
 
 
 state_manager = StateManager(STATE_FILE)
@@ -234,13 +253,16 @@ async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user:
         return
 
-    # cooldown gate
-    cd = state_manager.remaining_cooldown(user.id)
-    if cd > 0:
-        await update.message.reply_text(
-            f"⏳ Please wait {cd} seconds before requesting again."
-        )
-        return
+    is_admin = user.id in ADMIN_IDS
+
+    # cooldown gate (NON-ADMIN only)
+    if not is_admin:
+        cd = state_manager.remaining_cooldown(user.id)
+        if cd > 0:
+            await update.message.reply_text(
+                f"⏳ Please wait {cd} seconds before requesting again."
+            )
+            return
 
     if not context.args:
         await update.message.reply_text(
@@ -257,14 +279,34 @@ async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # do not count yet; only count on success
-    current_requests = state_manager.get_user_requests(user.id)
-    if current_requests >= MAX_REQUESTS_PER_USER:
+    # blocked email behaves like "no otp right now" (do not reveal it's blocked)
+    if state_manager.is_blocked(email):
+        if not is_admin:
+            state_manager.set_cooldown(user.id, COOLDOWN_SECONDS)
+
+        # --- WRITE LOG: blocked treated as no otp ---
+        try:
+            with open("otp_log.txt", "a") as lf:
+                lf.write(f"[{datetime.now()}] user={user.id} email={email} result=NO_OTP\n")
+        except Exception as _:
+            pass
+
         await update.message.reply_text(
-            f"⛔ You reached your limit ({MAX_REQUESTS_PER_USER})."
+            "❌ No OTP found right now. Please try again later."
         )
         return
-    remaining_if_success = MAX_REQUESTS_PER_USER - (current_requests + 1)
+
+    # do not count yet; only count on success (NON-ADMIN only quota)
+    if not is_admin:
+        current_requests = state_manager.get_user_requests(user.id)
+        if current_requests >= MAX_REQUESTS_PER_USER:
+            await update.message.reply_text(
+                f"⛔ You reached your limit ({MAX_REQUESTS_PER_USER})."
+            )
+            return
+        remaining_if_success = MAX_REQUESTS_PER_USER - (current_requests + 1)
+    else:
+        remaining_if_success = "∞"
 
     await update.message.reply_text(
         f"⏳ Waiting {DELAY_SECONDS} seconds before checking…\n"
@@ -272,7 +314,9 @@ async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📊 Remaining (if success): {remaining_if_success}"
     )
 
-    await asyncio.sleep(DELAY_SECONDS)
+    # initial delay (NON-ADMIN only)
+    if not is_admin:
+        await asyncio.sleep(DELAY_SECONDS)
 
     # ------- RETRY LOOP with user-visible attempt messages on NETWORK errors -------
     max_rounds = 5
@@ -281,10 +325,14 @@ async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             otp = await fetch_otp_from_generator(email)
 
             if otp:
-                # Count ONLY on success
-                state_manager.increment_user_requests(user.id)
+                # Count ONLY on success (NON-ADMIN only)
+                if not is_admin:
+                    state_manager.increment_user_requests(user.id)
                 state_manager.cache_otp(email, otp)
-                state_manager.set_cooldown(user.id, COOLDOWN_SECONDS)
+
+                # cooldown after success (NON-ADMIN only)
+                if not is_admin:
+                    state_manager.set_cooldown(user.id, COOLDOWN_SECONDS)
 
                 # --- WRITE LOG: success ---
                 try:
@@ -295,8 +343,11 @@ async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 _note_net_success()
 
-                now_used = state_manager.get_user_requests(user.id)
-                remaining = MAX_REQUESTS_PER_USER - now_used
+                if not is_admin:
+                    now_used = state_manager.get_user_requests(user.id)
+                    remaining = MAX_REQUESTS_PER_USER - now_used
+                else:
+                    remaining = "∞"
 
                 await update.message.reply_text(
                     f"✅ OTP Found!\n\n"
@@ -308,7 +359,9 @@ async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             else:
                 # no OTP found; do NOT decrement quota
-                state_manager.set_cooldown(user.id, COOLDOWN_SECONDS)
+                # cooldown after no-otp (NON-ADMIN only)
+                if not is_admin:
+                    state_manager.set_cooldown(user.id, COOLDOWN_SECONDS)
 
                 # --- WRITE LOG: no otp ---
                 try:
@@ -434,6 +487,77 @@ async def clearemail_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     else:
         await update.message.reply_text(f"ℹ️ No cached OTP found for {email}")
 
+# ---------------- Admin Block/Unblock ----------------
+async def block_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+    user = update.effective_user
+    if not user:
+        return
+
+    if user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Admin only.")
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "❌ Usage: /block <email>\n"
+            f"Example: /block user@{ALLOWED_DOMAIN}"
+        )
+        return
+
+    email = context.args[0].strip().lower()
+    if not email.endswith(f"@{ALLOWED_DOMAIN}"):
+        await update.message.reply_text(
+            f"❌ Invalid email domain. Only @{ALLOWED_DOMAIN} is supported."
+        )
+        return
+
+    state_manager.block_email(email, user.id)
+
+    try:
+        with open("otp_log.txt", "a") as lf:
+            lf.write(f"[{datetime.now()}] user={user.id} email={email} action=BLOCK\n")
+    except Exception as _:
+        pass
+
+    await update.message.reply_text("✅ Done.")
+
+async def unblock_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+    user = update.effective_user
+    if not user:
+        return
+
+    if user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Admin only.")
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "❌ Usage: /unblock <email>\n"
+            f"Example: /unblock user@{ALLOWED_DOMAIN}"
+        )
+        return
+
+    email = context.args[0].strip().lower()
+    if not email.endswith(f"@{ALLOWED_DOMAIN}"):
+        await update.message.reply_text(
+            f"❌ Invalid email domain. Only @{ALLOWED_DOMAIN} is supported."
+        )
+        return
+
+    ok = state_manager.unblock_email(email)
+
+    try:
+        with open("otp_log.txt", "a") as lf:
+            lf.write(f"[{datetime.now()}] user={user.id} email={email} action=UNBLOCK ok={ok}\n")
+    except Exception as _:
+        pass
+
+    await update.message.reply_text("✅ Done." if ok else "ℹ️ Not found.")
+
 # ---------------- Admin Log Viewer (/log) ----------------
 async def showlog_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -495,6 +619,8 @@ def main():
     application.add_handler(CommandHandler("remaining", remaining_command))
     application.add_handler(CommandHandler("resetlimit", resetlimit_command))
     application.add_handler(CommandHandler("clearemail", clearemail_command))
+    application.add_handler(CommandHandler("block", block_command))
+    application.add_handler(CommandHandler("unblock", unblock_command))
     application.add_handler(CommandHandler("log", showlog_command))
     application.add_error_handler(error_handler)
 
